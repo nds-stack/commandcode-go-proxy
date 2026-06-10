@@ -1,0 +1,20 @@
+# IDE & Editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Build artifacts
+bin/
+tmp/
+
+# Drafts & Claude config
+.drafts/
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
