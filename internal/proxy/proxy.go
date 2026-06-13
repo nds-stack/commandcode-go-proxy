@@ -25,6 +25,8 @@ const defaultTimeout = 600 * time.Second
 const maxRetries = 10
 const retryBaseDelay = 500 * time.Millisecond
 const retryMaxDelay = 30 * time.Second
+const retryRateLimitBase = 5 * time.Second
+const retryRateLimitMax = 60 * time.Second
 const debugLogLimit = 20000
 
 func truncateLog(s string) string {
@@ -38,6 +40,14 @@ func retryDelay(attempt int) time.Duration {
 	d := retryBaseDelay * time.Duration(1<<(attempt-1))
 	if d > retryMaxDelay {
 		d = retryMaxDelay
+	}
+	return d
+}
+
+func retryDelayRateLimit(attempt int) time.Duration {
+	d := retryRateLimitBase * time.Duration(1<<(attempt-1))
+	if d > retryRateLimitMax {
+		d = retryRateLimitMax
 	}
 	return d
 }
@@ -601,11 +611,16 @@ streamLoop:
 			log.Printf("[ERROR] Stream error: %v", event.Error)
 			if event.Error != nil && attempt < maxRetries {
 				msg := event.Error.Message
+				if strings.Contains(msg, "Rate limit") {
+					time.Sleep(retryDelayRateLimit(attempt))
+					continue streamLoop
+				}
 				if strings.Contains(msg, "Network connection lost") ||
 					strings.Contains(msg, "Gateway request failed") ||
 					strings.Contains(msg, "timeout") ||
 					strings.Contains(msg, "internal server error") ||
-					strings.Contains(msg, "Service temporarily unavailable") {
+					strings.Contains(msg, "Service temporarily unavailable") ||
+					strings.Contains(msg, "Connection error") {
 					continue streamLoop
 				}
 			}
