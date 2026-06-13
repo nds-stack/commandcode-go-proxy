@@ -83,10 +83,15 @@ func fetchVersionFromNPM() (*VersionInfo, error) {
 	}, nil
 }
 
-// init fetches the version on startup (in background)
+// init fetches the version on startup (in background) and caches it
 func init() {
 	go func() {
-		// Initial fetch - ignore error, will retry on first use
-		_, _ = fetchVersionFromNPM()
+		info, err := fetchVersionFromNPM()
+		if err != nil {
+			return
+		}
+		versionMu.Lock()
+		versionInfo = info
+		versionMu.Unlock()
 	}()
 }

@@ -5,7 +5,7 @@ tmp_dir = "tmp"
   bin = "bin\\commandcode-go-proxy.exe"
   cmd = "go build -o bin\\commandcode-go-proxy.exe ."
   delay = 1000
-  exclude_dir = ["tmp", "test", "bin", "node_modules"]
+  exclude_dir = ["tmp", "test", "bin", "node_modules", "riset"]
   exclude_file = []
   exclude_regex = []
   exclude_unchanged = true
@@ -27,5 +27,5 @@ tmp_dir = "tmp"
 [watch]
   include_ext = ["go"]
   include_dir = ["internal", "."]
-  exclude_dir = ["tmp", "test", "vendor", "bin", "node_modules"]
+  exclude_dir = ["tmp", "test", "vendor", "bin", "node_modules", "riset"]
   exclude_regex = []
