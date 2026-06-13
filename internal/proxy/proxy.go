@@ -1,10 +1,9 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log"
@@ -16,11 +15,16 @@ import (
 	"github.com/nds-stack/commandcode-go-proxy/internal/api"
 	"github.com/nds-stack/commandcode-go-proxy/internal/version"
 	"github.com/google/uuid"
+	jsoniter "github.com/json-iterator/go"
 )
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 600 * time.Second
-const maxRetries = 4
+const maxRetries = 10
+const retryBaseDelay = 500 * time.Millisecond
+const retryMaxDelay = 30 * time.Second
 const debugLogLimit = 20000
 
 func truncateLog(s string) string {
@@ -30,10 +34,58 @@ func truncateLog(s string) string {
 	return s[:debugLogLimit] + fmt.Sprintf("... [truncated %d bytes]", len(s)-debugLogLimit)
 }
 
-func (p *Proxy) debugf(format string, args ...any) {
-	if p.Debug {
-		log.Printf(format, args...)
+func retryDelay(attempt int) time.Duration {
+	d := retryBaseDelay * time.Duration(1<<(attempt-1))
+	if d > retryMaxDelay {
+		d = retryMaxDelay
 	}
+	return d
+}
+
+// getSessionID finds a session ID from client headers
+// Priority: x-session-id > x-session-affinity > hash of static headers > generated
+func getSessionID(clientHeaders http.Header, apiKey string) string {
+	// 1. Check specific headers
+	if id := clientHeaders.Get("X-Session-Id"); id != "" {
+		return id
+	}
+	if id := clientHeaders.Get("X-Session-Affinity"); id != "" {
+		return id
+	}
+
+	// 2. Hash all static headers (exclude dynamic ones)
+	exclude := map[string]bool{
+		"content-length":  true,
+		"cookie":          true,
+		"cookies":         true,
+		"set-cookie":      true,
+		"date":            true,
+		"if-modified-since": true,
+		"if-none-match":   true,
+	}
+	var parts []string
+	for name, values := range clientHeaders {
+		if exclude[strings.ToLower(name)] {
+			continue
+		}
+		for _, v := range values {
+			parts = append(parts, name+"="+v)
+		}
+	}
+	if len(parts) > 0 {
+		hash := sha256.Sum256([]byte(strings.Join(parts, "|")))
+		return "sess_" + fmt.Sprintf("%x", hash[:8])
+	}
+
+	// 3. Fallback: generate from API key
+	hash := sha256.Sum256([]byte(apiKey))
+	return "sess_" + fmt.Sprintf("%x", hash[:8])
+}
+
+func (p *Proxy) debugClientf(format string, args ...any) {
+}
+
+func (p *Proxy) debugServerf(format string, args ...any) {
 }
 
 func (p *Proxy) writeOpenAIError(w http.ResponseWriter, status int, message, errType string) {
@@ -139,13 +191,13 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 }
 
 // CreateUpstreamRequest creates a new HTTP request to the CommandCode API
-func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string) (*http.Request, error) {
+func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string, sessionID string) (*http.Request, error) {
 	reqJSON, err := json.Marshal(ccBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
-	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+	p.debugClientf("[DEBUG] Outgoing CC request body: %s", truncateLog(string(reqJSON)))
 
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
@@ -157,8 +209,15 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	ccReq.Header.Set("Authorization", "Bearer "+apiKey)
 	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
 	ccReq.Header.Set("x-cli-environment", "production")
+	ccReq.Header.Set("x-session-id", sessionID)
+	ccReq.Header.Set("x-project-slug", ".")
+	ccReq.Header.Set("x-taste-learning", "false")
+	ccReq.Header.Set("x-co-flag", "false")
 	ccReq.Header.Set("Accept", "text/event-stream")
-	p.debugf("[DEBUG] Auth header: Bearer %s...", apiKey[:min(len(apiKey), 8)])
+	p.debugClientf("[DEBUG] Outgoing CC request headers:")
+	for name, values := range ccReq.Header {
+		p.debugClientf("[DEBUG]   %s: %s", name, strings.Join(values, ", "))
+	}
 
 	return ccReq, nil
 }
@@ -198,7 +257,11 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.debugf("[DEBUG] Client request body: %s", truncateLog(string(body)))
+	p.debugClientf("[DEBUG] Incoming client request headers:")
+	for name, values := range r.Header {
+		p.debugClientf("[DEBUG]   %s: %s", name, strings.Join(values, ", "))
+	}
+	p.debugClientf("[DEBUG] Incoming client request body: %s", truncateLog(string(body)))
 
 	var openAIReq api.OpenAIChatRequest
 	if err := json.Unmarshal(body, &openAIReq); err != nil {
@@ -218,8 +281,11 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get session ID from client or derive from API key
+	sessionID := getSessionID(r.Header, apiKey)
+
 	// Create upstream request
-	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
+	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey, sessionID)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
 		return
@@ -231,13 +297,13 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Call upstream with retry
 	var ccResp *http.Response
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-	if attempt > 0 {
-				fmt.Printf("\n  ⚠ Request failed — auto-retrying (%d/%d)...\n", attempt, maxRetries)
-				log.Printf("[RETRY] Upstream call (attempt %d/%d)", attempt, maxRetries)
-				time.Sleep(time.Duration(200*(1<<(attempt-1))) * time.Millisecond)
-			}
+		if attempt > 0 {
+			fmt.Printf("\n  ⚠ Request failed — auto-retrying (%d/%d)...\n", attempt, maxRetries)
+			log.Printf("[RETRY] Upstream call (attempt %d/%d)", attempt, maxRetries)
+			time.Sleep(retryDelay(attempt))
+		}
 
-			ccReq, err = p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
+		ccReq, err = p.CreateUpstreamRequest(r.Context(), ccBody, apiKey, sessionID)
 		if err != nil {
 			continue
 		}
@@ -245,24 +311,22 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ccResp, err = p.CallUpstream(ccReq)
 		if err != nil {
 			log.Printf("[ERROR] Upstream call failed: %v", err)
-			if attempt < maxRetries {
-				continue
-			}
-			p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
-			return
+			continue
 		}
 
 		if ccResp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(ccResp.Body)
+			statusCode := ccResp.StatusCode
 			ccResp.Body.Close()
+			ccResp = nil
 			message := fmt.Sprintf("Upstream error: %s", string(errBody))
-			log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, string(errBody))
+			log.Printf("[ERROR] Upstream returned %d: %s", statusCode, string(errBody))
 			if attempt < maxRetries {
 				continue
 			}
 			status := http.StatusBadGateway
-			if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
-				status = ccResp.StatusCode
+			if statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError {
+				status = statusCode
 			}
 			p.writeOpenAIError(w, status, message, "api_error")
 			return
@@ -270,10 +334,21 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		break
 	}
+
+	if ccResp == nil {
+		p.writeOpenAIError(w, http.StatusBadGateway, "All upstream attempts failed", "api_error")
+		return
+	}
 	defer ccResp.Body.Close()
 
+	p.debugServerf("[DEBUG] Upstream response status: %d", ccResp.StatusCode)
+	p.debugServerf("[DEBUG] Upstream response headers:")
+	for name, values := range ccResp.Header {
+		p.debugServerf("[DEBUG]   %s: %s", name, strings.Join(values, ", "))
+	}
+
 	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created, openAIReq, apiKey)
+		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created, openAIReq, apiKey, sessionID)
 	} else {
 		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created)
 	}
@@ -281,7 +356,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE.
 // Retries transparently on "Network connection lost" without the client noticing.
-func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, initialResp *http.Response, requestID, model string, created int64, openAIReq api.OpenAIChatRequest, apiKey string) {
+func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, initialResp *http.Response, requestID, model string, created int64, openAIReq api.OpenAIChatRequest, apiKey string, sessionID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
@@ -304,12 +379,12 @@ streamLoop:
 		if attempt > 0 {
 			fmt.Printf("\n  ⚠ Connection lost or error — auto-retrying (%d/%d)...\n", attempt, maxRetries)
 			log.Printf("[RETRY] Reconnecting stream (attempt %d/%d)", attempt, maxRetries)
-			time.Sleep(time.Duration(200*(1<<(attempt-1))) * time.Millisecond)
+			time.Sleep(retryDelay(attempt))
 			newBody, err := p.BuildRequest(openAIReq)
 			if err != nil {
 				continue
 			}
-			newReq, err := p.CreateUpstreamRequest(r.Context(), newBody, apiKey)
+			newReq, err := p.CreateUpstreamRequest(r.Context(), newBody, apiKey, sessionID)
 			if err != nil {
 				continue
 			}
@@ -318,28 +393,32 @@ streamLoop:
 			if err != nil || resp.StatusCode != http.StatusOK {
 				continue
 			}
+			sentRole = false
+			toolCallIndex = 0
+			toolCallIndexes = map[string]int{}
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 256*1024), 10*1024*1024)
+		decoder := json.NewDecoder(resp.Body)
 
-		for scanner.Scan() {
+		for {
 			select {
 			case <-r.Context().Done():
 				return
 			default:
 			}
 
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
 			var event api.CCStreamEvent
-			if err := json.Unmarshal([]byte(line), &event); err != nil {
-				continue
+			if err := decoder.Decode(&event); err != nil {
+				if err == io.EOF {
+					break
+				}
+				log.Printf("[ERROR] Decode error: %v", err)
+				if attempt < maxRetries {
+					continue streamLoop
+				}
+				return
 			}
+			p.debugServerf("[DEBUG] CommandCode stream line: %s", truncateLog(event.Type))
 
 			switch event.Type {
 			case "reasoning-delta":
@@ -392,8 +471,12 @@ streamLoop:
 				toolCallIndex++
 
 			case "tool-delta":
+				idx := toolCallIndex - 1
+				if idx < 0 {
+					idx = 0
+				}
 				toolCalls := []api.OpenAIDeltaToolCall{{
-					Index:    toolCallIndex - 1,
+					Index:    idx,
 					Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
 				}}
 				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
@@ -529,9 +612,6 @@ streamLoop:
 			}
 		}
 
-		if err := scanner.Err(); err != nil && err != io.EOF {
-			log.Printf("[ERROR] Scanner error: %v", err)
-		}
 		return
 	}
 }
@@ -545,8 +625,7 @@ func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatR
 
 // NonStreamResponse handles non-streaming response
 func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 256*1024), 10*1024*1024)
+	decoder := json.NewDecoder(ccResp.Body)
 
 	var content strings.Builder
 	var reasoning strings.Builder
@@ -556,17 +635,16 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	toolCallByID := map[string]int{}
 	toolInputBuffers := map[string]*strings.Builder{}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
+	for {
 		var event api.CCStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("[ERROR] Decode error: %v", err)
+			break
 		}
+		p.debugServerf("[DEBUG] CommandCode stream line: %s", truncateLog(event.Type))
 
 		switch event.Type {
 		case "reasoning-delta":
@@ -686,7 +764,7 @@ func (p *Proxy) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.debugf("[DEBUG] Client responses request body: %s", truncateLog(string(body)))
+	p.debugClientf("[DEBUG] Incoming responses request body: %s", truncateLog(string(body)))
 
 	var responsesReq api.OpenAIResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
@@ -778,29 +856,18 @@ func responseItemsToMessages(items []any) []api.OpenAIMessage {
 
 // HandleModels handles the /v1/models endpoint
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
+	data := make([]api.OpenAIModel, len(Models))
+	for i, m := range Models {
+		data[i] = api.OpenAIModel{
+			ID:      m.ID,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: m.Owner,
+		}
+	}
 	models := api.OpenAIModelList{
 		Object: "list",
-		Data: []api.OpenAIModel{
-			// MoonshotAI
-			{ID: "moonshotai/Kimi-K2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "moonshotai/Kimi-K2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			// ZhipuAI
-			{ID: "zai-org/GLM-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "zai-org/GLM-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			// MiniMaxAI
-			{ID: "MiniMaxAI/MiniMax-M2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "MiniMaxAI/MiniMax-M2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			// DeepSeek
-			{ID: "deepseek/deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			{ID: "deepseek/deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			// Qwen
-			{ID: "Qwen/Qwen3.6-Max-Preview", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "Qwen/Qwen3.6-Plus", Object: "model", Created: 0, OwnedBy: "qwen"},
-			// StepFun
-			{ID: "stepfun/Step-3.5-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			// Google
-			{ID: "google/gemini-3.1-flash-lite", Object: "model", Created: 0, OwnedBy: "google"},
-		},
+		Data:   data,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(models)
