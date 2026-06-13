@@ -389,6 +389,9 @@ streamLoop:
 		if attempt > 0 {
 			fmt.Printf("\n  ⚠ Connection lost or error — auto-retrying (%d/%d)...\n", attempt, maxRetries)
 			log.Printf("[RETRY] Reconnecting stream (attempt %d/%d)", attempt, maxRetries)
+			if r.Context().Err() != nil {
+				return
+			}
 			time.Sleep(retryDelay(attempt))
 			newBody, err := p.BuildRequest(openAIReq)
 			if err != nil {
@@ -400,7 +403,10 @@ streamLoop:
 			}
 			resp.Body.Close()
 			resp, err = p.CallUpstream(newReq)
-			if err != nil || resp.StatusCode != http.StatusOK {
+			if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+				if resp != nil {
+					resp.Body.Close()
+				}
 				continue
 			}
 			sentRole = false
@@ -421,6 +427,9 @@ streamLoop:
 			if err := decoder.Decode(&event); err != nil {
 				if err == io.EOF {
 					break
+				}
+				if r.Context().Err() != nil {
+					return
 				}
 				log.Printf("[ERROR] Decode error: %v", err)
 				if attempt < maxRetries {
