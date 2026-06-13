@@ -27,6 +27,7 @@ const retryBaseDelay = 500 * time.Millisecond
 const retryMaxDelay = 30 * time.Second
 const retryRateLimitBase = 5 * time.Second
 const retryRateLimitMax = 60 * time.Second
+const streamIdleTimeout = 2 * time.Minute
 const debugLogLimit = 20000
 
 func truncateLog(s string) string {
@@ -384,6 +385,11 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, initialRe
 	toolCallIndexes := map[string]int{}
 	var promptTokens, completionTokens int
 
+	type decodeResult struct {
+		event api.CCStreamEvent
+		err   error
+	}
+
 streamLoop:
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -416,237 +422,264 @@ streamLoop:
 
 		decoder := json.NewDecoder(resp.Body)
 		finished := false
+		eventCh := make(chan decodeResult)
+
+		go func() {
+			for {
+				var event api.CCStreamEvent
+				err := decoder.Decode(&event)
+				eventCh <- decodeResult{event, err}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		idleTimer := time.NewTimer(streamIdleTimeout)
 
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			default:
-			}
 
-			var event api.CCStreamEvent
-			if err := decoder.Decode(&event); err != nil {
-				if err == io.EOF {
-					if !finished && attempt < maxRetries {
-						log.Printf("[WARN] Stream truncated: ended without finish event")
-						continue streamLoop
-					}
-					break
-				}
-				if r.Context().Err() != nil {
-					return
-				}
-				log.Printf("[ERROR] Decode error: %v", err)
+			case <-idleTimer.C:
+				log.Printf("[WARN] Stream idle timeout after %v", streamIdleTimeout)
 				if attempt < maxRetries {
 					continue streamLoop
 				}
 				return
-			}
-			p.debugServerf("[DEBUG] CommandCode stream line: %s", truncateLog(event.Type))
 
-			switch event.Type {
-			case "abort":
-				continue
+			case result := <-eventCh:
+				if result.err != nil {
+					if result.err == io.EOF {
+						if !finished && attempt < maxRetries {
+							log.Printf("[WARN] Stream truncated: ended without finish event")
+							continue streamLoop
+						}
+						return
+					}
+					if r.Context().Err() != nil {
+						return
+					}
+					log.Printf("[ERROR] Decode error: %v", result.err)
+					if attempt < maxRetries {
+						continue streamLoop
+					}
+					return
+				}
 
-			case "reasoning-delta":
-				delta := api.OpenAIDelta{ReasoningContent: event.Text}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "text-delta":
-				delta := api.OpenAIDelta{Content: event.Text}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "tool-use":
-				toolCalls := []api.OpenAIDeltaToolCall{{
-					Index:    toolCallIndex,
-					ID:       event.ToolCallID,
-					Type:     "function",
-					Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
-				}}
-				delta := api.OpenAIDelta{ToolCalls: toolCalls}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-				toolCallIndex++
-
-			case "tool-delta":
-				idx := toolCallIndex - 1
-				if idx < 0 {
-					idx = 0
-				}
-				toolCalls := []api.OpenAIDeltaToolCall{{
-					Index:    idx,
-					Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
-				}}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
-				})
-
-			case "tool-input-start":
-				if _, ok := toolCallIndexes[event.ID]; !ok {
-					toolCallIndexes[event.ID] = toolCallIndex
-					toolCallIndex++
-				}
-				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-					Index: toolCallIndexes[event.ID],
-					ID:    event.ID,
-					Type:  "function",
-					Function: &api.OpenAIDeltaFunction{
-						Name: event.ToolName,
-					},
-				}}}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
-
-			case "tool-input-delta":
-				idx, ok := toolCallIndexes[event.ID]
-				if !ok {
-					idx = toolCallIndex
-					toolCallIndexes[event.ID] = idx
-					toolCallIndex++
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-						Index:    idx,
-						Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
-					}}}}},
-				})
-
-			case "tool-call":
-				if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
-					continue
-				}
-				idx := toolCallIndex
-				toolCallIndexes[event.ToolCallID] = idx
-				toolCallIndex++
-				args := ""
-				if event.Input != nil {
-					if data, err := json.Marshal(event.Input); err == nil {
-						args = string(data)
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
 					}
 				}
-				delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-					Index: idx,
-					ID:    event.ToolCallID,
-					Type:  "function",
-					Function: &api.OpenAIDeltaFunction{
-						Name:      event.ToolName,
-						Arguments: args,
-					},
-				}}}
-				if !sentRole {
-					delta.Role = "assistant"
-					sentRole = true
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-				})
+				idleTimer.Reset(streamIdleTimeout)
 
-			case "finish-step":
-				if event.TotalUsage != nil {
-					promptTokens = event.TotalUsage.InputTokens
-					completionTokens = event.TotalUsage.OutputTokens
-				}
+				event := result.event
 
-			case "finish":
-				finished = true
-				if event.TotalUsage != nil {
-					promptTokens = event.TotalUsage.InputTokens
-					completionTokens = event.TotalUsage.OutputTokens
-				}
-				reason := normalizeFinishReason(event.FinishReason)
-				usage := &api.OpenAIUsage{
-					PromptTokens:     promptTokens,
-					CompletionTokens: completionTokens,
-					TotalTokens:      promptTokens + completionTokens,
-				}
-				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{{
-						Index:        0,
-						Delta:        &api.OpenAIDelta{},
-						FinishReason: &reason,
-					}},
-					Usage: usage,
-				})
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
+				switch event.Type {
+				case "abort":
+					continue
 
-		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
-			if event.Error != nil && attempt < maxRetries {
-				msg := event.Error.Message
-				if strings.Contains(msg, "Rate limit") {
-					time.Sleep(retryDelayRateLimit(attempt))
-					continue streamLoop
+				case "reasoning-delta":
+					delta := api.OpenAIDelta{ReasoningContent: event.Text}
+					if !sentRole {
+						delta.Role = "assistant"
+						sentRole = true
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+					})
+
+				case "text-delta":
+					delta := api.OpenAIDelta{Content: event.Text}
+					if !sentRole {
+						delta.Role = "assistant"
+						sentRole = true
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+					})
+
+				case "tool-use":
+					toolCalls := []api.OpenAIDeltaToolCall{{
+						Index:    toolCallIndex,
+						ID:       event.ToolCallID,
+						Type:     "function",
+						Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
+					}}
+					delta := api.OpenAIDelta{ToolCalls: toolCalls}
+					if !sentRole {
+						delta.Role = "assistant"
+						sentRole = true
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+					})
+					toolCallIndex++
+
+				case "tool-delta":
+					idx := toolCallIndex - 1
+					if idx < 0 {
+						idx = 0
+					}
+					toolCalls := []api.OpenAIDeltaToolCall{{
+						Index:    idx,
+						Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
+					}}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
+					})
+
+				case "tool-input-start":
+					if _, ok := toolCallIndexes[event.ID]; !ok {
+						toolCallIndexes[event.ID] = toolCallIndex
+						toolCallIndex++
+					}
+					delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+						Index: toolCallIndexes[event.ID],
+						ID:    event.ID,
+						Type:  "function",
+						Function: &api.OpenAIDeltaFunction{
+							Name: event.ToolName,
+						},
+					}}}
+					if !sentRole {
+						delta.Role = "assistant"
+						sentRole = true
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+					})
+
+				case "tool-input-delta":
+					idx, ok := toolCallIndexes[event.ID]
+					if !ok {
+						idx = toolCallIndex
+						toolCallIndexes[event.ID] = idx
+						toolCallIndex++
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+							Index:    idx,
+							Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
+						}}}}},
+					})
+
+				case "tool-call":
+					if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
+						continue
+					}
+					idx := toolCallIndex
+					toolCallIndexes[event.ToolCallID] = idx
+					toolCallIndex++
+					args := ""
+					if event.Input != nil {
+						if data, err := json.Marshal(event.Input); err == nil {
+							args = string(data)
+						}
+					}
+					delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
+						Index: idx,
+						ID:    event.ToolCallID,
+						Type:  "function",
+						Function: &api.OpenAIDeltaFunction{
+							Name:      event.ToolName,
+							Arguments: args,
+						},
+					}}}
+					if !sentRole {
+						delta.Role = "assistant"
+						sentRole = true
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+					})
+
+				case "finish-step":
+					if event.TotalUsage != nil {
+						promptTokens = event.TotalUsage.InputTokens
+						completionTokens = event.TotalUsage.OutputTokens
+					}
+
+				case "finish":
+					finished = true
+					if event.TotalUsage != nil {
+						promptTokens = event.TotalUsage.InputTokens
+						completionTokens = event.TotalUsage.OutputTokens
+					}
+					reason := normalizeFinishReason(event.FinishReason)
+					usage := &api.OpenAIUsage{
+						PromptTokens:     promptTokens,
+						CompletionTokens: completionTokens,
+						TotalTokens:      promptTokens + completionTokens,
+					}
+					p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+						ID:      requestID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []api.OpenAIChoice{{
+							Index:        0,
+							Delta:        &api.OpenAIDelta{},
+							FinishReason: &reason,
+						}},
+						Usage: usage,
+					})
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
+
+				case "error":
+					log.Printf("[ERROR] Stream error: %v", event.Error)
+					if event.Error != nil && attempt < maxRetries {
+						msg := event.Error.Message
+						if strings.Contains(msg, "Rate limit") {
+							time.Sleep(retryDelayRateLimit(attempt))
+							continue streamLoop
+						}
+						if strings.Contains(msg, "Network connection lost") ||
+							strings.Contains(msg, "Gateway request failed") ||
+							strings.Contains(msg, "timeout") ||
+							strings.Contains(msg, "internal server error") ||
+							strings.Contains(msg, "Service temporarily unavailable") ||
+							strings.Contains(msg, "Connection error") {
+							continue streamLoop
+						}
+					}
+					return
 				}
-				if strings.Contains(msg, "Network connection lost") ||
-					strings.Contains(msg, "Gateway request failed") ||
-					strings.Contains(msg, "timeout") ||
-					strings.Contains(msg, "internal server error") ||
-					strings.Contains(msg, "Service temporarily unavailable") ||
-					strings.Contains(msg, "Connection error") {
-					continue streamLoop
-				}
-			}
-			return
 			}
 		}
-
-		return
 	}
 }
 
