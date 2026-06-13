@@ -604,7 +604,8 @@ streamLoop:
 				if strings.Contains(msg, "Network connection lost") ||
 					strings.Contains(msg, "Gateway request failed") ||
 					strings.Contains(msg, "timeout") ||
-					strings.Contains(msg, "internal server error") {
+					strings.Contains(msg, "internal server error") ||
+					strings.Contains(msg, "Service temporarily unavailable") {
 					continue streamLoop
 				}
 			}
