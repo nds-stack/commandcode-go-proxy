@@ -415,6 +415,7 @@ streamLoop:
 		}
 
 		decoder := json.NewDecoder(resp.Body)
+		finished := false
 
 		for {
 			select {
@@ -426,6 +427,10 @@ streamLoop:
 			var event api.CCStreamEvent
 			if err := decoder.Decode(&event); err != nil {
 				if err == io.EOF {
+					if !finished && attempt < maxRetries {
+						log.Printf("[WARN] Stream truncated: ended without finish event")
+						continue streamLoop
+					}
 					break
 				}
 				if r.Context().Err() != nil {
@@ -440,6 +445,9 @@ streamLoop:
 			p.debugServerf("[DEBUG] CommandCode stream line: %s", truncateLog(event.Type))
 
 			switch event.Type {
+			case "abort":
+				continue
+
 			case "reasoning-delta":
 				delta := api.OpenAIDelta{ReasoningContent: event.Text}
 				if !sentRole {
@@ -590,6 +598,7 @@ streamLoop:
 				}
 
 			case "finish":
+				finished = true
 				if event.TotalUsage != nil {
 					promptTokens = event.TotalUsage.InputTokens
 					completionTokens = event.TotalUsage.OutputTokens
