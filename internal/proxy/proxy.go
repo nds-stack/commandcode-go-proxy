@@ -153,6 +153,19 @@ func NewProxy(apiKey string, timeout time.Duration) *Proxy {
 	}
 }
 
+// normalizeReasoningEffort validates and normalizes reasoning_effort value
+func normalizeReasoningEffort(val string) string {
+	valid := map[string]bool{"low": true, "medium": true, "high": true}
+	if valid[val] {
+		return val
+	}
+	lower := strings.ToLower(val)
+	if valid[lower] {
+		return lower
+	}
+	return "low"
+}
+
 // BuildRequest builds the CommandCode request body
 func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody, error) {
 	model := MapModel(openAIReq.Model)
@@ -194,7 +207,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			MaxTokens:        maxTokens,
 			Temperature:      temperature,
 			Stream:           true,
-			ReasoningEffort:  openAIReq.ReasoningEffort,
+			ReasoningEffort:  normalizeReasoningEffort(openAIReq.ReasoningEffort),
 		},
 	}
 
