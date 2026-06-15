@@ -6,16 +6,13 @@
 
 Proxy server kompatibel OpenAI untuk pengguna CommandCode plan **Go**.
 
-Repository: https://github.com/nds-stack/commandcode-go-proxy  
-Versi: `v0.1.0`
+Repository: https://github.com/nds-stack/commandcode-go-proxy
 
 ## Apa ini?
 
-CommandCode punya 4 plan: **Go**, **Pro**, **Max**, **Ultra**.
+CommandCode punya beberapa plan, dan plan **Go** tidak bisa langsung akses endpoint OpenAI kompatibel.
 
-Yang jadi masalah — plan Pro, Max, dan Ultra bisa langsung akses API CommandCode lewat endpoint OpenAI/Anthropic. Tapi plan **Go?** Tidak bisa. Bahkan sekadar hit endpoint OpenAI kompatibel pun tidak diijinkan.
-
-Proxy ini solusinya. Jalankan proxy lokal ini, dan kamu bisa pakai CommandCode plan Go seperti biasa lewat endpoint OpenAI kompatibel.
+Proxy ini solusinya. Jalankan proxy lokal ini, dan kamu bisa pakai CommandCode plan Go lewat endpoint OpenAI kompatibel.
 
 ## Install & Jalankan
 
@@ -41,7 +38,7 @@ go run main.go -api-key commandcode-api-key-kamu
 
 ## Pakai
 
-Proxy ini expose endpoint yang 100% kompatibel sama OpenAI API. Jadi kamu bisa pakai client OpenAI library apapun, ganti base URL ke proxy ini, dan langsung jalan.
+Proxy ini expose endpoint OpenAI kompatibel. Kamu bisa pakai client OpenAI library apapun, ganti base URL ke proxy ini.
 
 ### Contoh dengan curl
 
@@ -145,7 +142,6 @@ GOOS=linux GOARCH=amd64 go build -o bin/commandcode-go-proxy
 | `-port` | `9173` | Port server |
 | `-api-key` | - | API key default |
 | `-timeout` | `600s` | Timeout request |
-| `-debug` | `false` | Debug logging |
 | `-version` | `false` | Cek versi |
 
 ## Cara Kerja
@@ -166,14 +162,18 @@ Client (OpenAI SDK/curl)
 ```
 
 1. Client kirim request format OpenAI
-2. Proxy konversi ke format CommandCode (extract system message, map model, convert messages)
-3. Proxy forward ke `api.commandcode.ai/alpha/generate`
+2. Proxy konversi ke format CommandCode (extract system message, map model, convert messages, validasi reasoning effort)
+3. Proxy forward ke `api.commandcode.ai/alpha/generate` dengan header lengkap (session ID, version, taste-learning, co-flag, project-slug)
 4. Respons streaming NDJSON dari CommandCode dikonversi balik ke SSE format OpenAI
+5. Retry otomatis (10x, exponential backoff) untuk error: network connection lost, gateway failed, timeout, rate limit, service unavailable, connection error
+6. Idle timeout 2 menit — kalau stream tidak ada data baru, retry otomatis
+7. Deteksi stream terpotong (EOF tanpa event `finish`) → retry
 
 ## Struktur Project
 
 ```
 ├── main.go                    # Entry point, CLI flags, startup info
+├── go.mod / go.sum            # Dependencies
 ├── assets/
 │   └── banner.jpg             # Banner
 ├── internal/
@@ -181,16 +181,17 @@ Client (OpenAI SDK/curl)
 │   │   ├── commandcode.go     # Request/response CommandCode
 │   │   └── openai.go          # Request/response OpenAI
 │   ├── proxy/                 # Logika proxy utama
-│   │   ├── proxy.go           # Handler, streaming, retry
+│   │   ├── proxy.go           # Handler, streaming, retry, idle timeout
 │   │   ├── convert.go         # Konversi message & tool format
 │   │   └── model.go           # Pemetaan nama model
-│   ├── server/                # HTTP server wrapper
+│   ├── server/                # HTTP server wrapper + graceful shutdown
 │   │   └── server.go
 │   ├── update/                # Cek versi terbaru dari GitHub
 │   │   └── update.go
 │   └── version/               # Fetch versi command-code dari npm
 │       └── version.go
-└── test/                      # Script testing
+├── test/                      # Script testing
+└── riset/                     # Riset & reverse engineering CommandCode API
 ```
 
 ## License
