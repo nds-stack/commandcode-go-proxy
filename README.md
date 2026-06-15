@@ -191,7 +191,6 @@ Client (OpenAI SDK/curl)
 │   └── version/               # Fetch versi command-code dari npm
 │       └── version.go
 ├── test/                      # Script testing
-└── riset/                     # Riset & reverse engineering CommandCode API
 ```
 
 ## License
