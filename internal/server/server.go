@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -14,6 +16,28 @@ import (
 
 const defaultPort = "9173"
 const defaultHost = "127.0.0.1"
+
+var requestCounter uint64
+
+var colors = []string{
+	"\033[32m", // green
+	"\033[36m", // cyan
+	"\033[33m", // yellow
+	"\033[35m", // magenta
+	"\033[34m", // blue
+	"\033[31m", // red
+	"\033[92m", // light green
+	"\033[96m", // light cyan
+	"\033[93m", // light yellow
+	"\033[95m", // light magenta
+}
+
+const resetColor = "\033[0m"
+
+func nextColor() string {
+	n := atomic.AddUint64(&requestCounter, 1)
+	return colors[(int(n)-1)%len(colors)]
+}
 
 // Server represents the HTTP server
 type Server struct {
@@ -67,13 +91,14 @@ func (s *Server) GetHost() string {
 	return s.Host
 }
 
-// logger is a middleware for logging requests
+// logger is a middleware for logging requests with per-request colors
 func logger(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		color := nextColor()
 		start := time.Now()
-		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
+		fmt.Printf("%s[%s] %s %s%s\n", color, r.Method, r.URL.Path, r.RemoteAddr, resetColor)
 		next(w, r)
-		log.Printf("[%s] %s done in %v", r.Method, r.URL.Path, time.Since(start))
+		fmt.Printf("%s[%s] %s done in %v%s\n", color, r.Method, r.URL.Path, time.Since(start), resetColor)
 	}
 }
 
