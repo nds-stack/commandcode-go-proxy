@@ -25,32 +25,32 @@ const versionCacheDuration = 30 * time.Minute
 // GetCommandCodeVersion fetches the latest version from npm registry
 // It caches the result for 30 minutes to avoid excessive API calls
 func GetCommandCodeVersion() string {
+	// Fast path: check with read lock
 	versionMu.RLock()
 	info := versionInfo
 	versionMu.RUnlock()
 
-	// Return cached version if still valid
 	if info != nil && time.Since(info.LastUpdated) < versionCacheDuration {
 		return info.Version
 	}
 
-	// Fetch new version
+	// Slow path: acquire write lock and double-check
+	versionMu.Lock()
+	defer versionMu.Unlock()
+
+	if versionInfo != nil && time.Since(versionInfo.LastUpdated) < versionCacheDuration {
+		return versionInfo.Version
+	}
+
 	newInfo, err := fetchVersionFromNPM()
 	if err != nil {
-		// Return cached version on error, or default
-		versionMu.RLock()
-		defer versionMu.RUnlock()
 		if versionInfo != nil {
 			return versionInfo.Version
 		}
 		return "unknown"
 	}
 
-	// Update cache
-	versionMu.Lock()
 	versionInfo = newInfo
-	versionMu.Unlock()
-
 	return newInfo.Version
 }
 

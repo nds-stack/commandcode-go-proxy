@@ -183,6 +183,9 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	if openAIReq.MaxCompletionTokens != nil {
 		maxTokens = *openAIReq.MaxCompletionTokens
 	}
+	if maxTokens < 1 {
+		maxTokens = 64000
+	}
 
 	tools := ConvertTools(openAIReq.Tools)
 
@@ -435,7 +438,7 @@ streamLoop:
 
 		decoder := json.NewDecoder(resp.Body)
 		finished := false
-		eventCh := make(chan decodeResult)
+		eventCh := make(chan decodeResult, 1)
 
 		go func() {
 			for {
@@ -510,7 +513,7 @@ streamLoop:
 					})
 
 				case "text-delta":
-					delta := api.OpenAIDelta{Content: event.Text}
+					delta := api.OpenAIDelta{Content: &event.Text}
 					if !sentRole {
 						delta.Role = "assistant"
 						sentRole = true

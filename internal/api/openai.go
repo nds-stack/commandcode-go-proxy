@@ -89,7 +89,7 @@ type OpenAIChoice struct {
 
 type OpenAIDelta struct {
 	Role             string                `json:"role,omitempty"`
-	Content          string                `json:"content,omitempty"`
+	Content          *string               `json:"content,omitempty"`
 	ToolCalls        []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
 	Refusal          string                `json:"refusal,omitempty"`
 	ReasoningContent string                `json:"reasoning_content,omitempty"`
