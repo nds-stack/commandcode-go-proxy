@@ -327,16 +327,25 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if attempt > 0 {
 			fmt.Printf("\n  ⚠ Request failed — auto-retrying (%d/%d)...\n", attempt, maxRetries)
 			log.Printf("[RETRY] Upstream call (attempt %d/%d)", attempt, maxRetries)
+			if r.Context().Err() != nil {
+				return
+			}
 			time.Sleep(retryDelay(attempt))
 		}
 
 		ccReq, err = p.CreateUpstreamRequest(r.Context(), ccBody, apiKey, sessionID)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			continue
 		}
 
 		ccResp, err = p.CallUpstream(ccReq)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			log.Printf("[ERROR] Upstream call failed: %v", err)
 			continue
 		}
@@ -417,17 +426,28 @@ streamLoop:
 			time.Sleep(retryDelay(attempt))
 			newBody, err := p.BuildRequest(openAIReq)
 			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
 				continue
 			}
 			newReq, err := p.CreateUpstreamRequest(r.Context(), newBody, apiKey, sessionID)
 			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
 				continue
 			}
-			resp.Body.Close()
+			if resp != nil {
+				resp.Body.Close()
+			}
 			resp, err = p.CallUpstream(newReq)
 			if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
 				if resp != nil {
 					resp.Body.Close()
+				}
+				if r.Context().Err() != nil {
+					return
 				}
 				continue
 			}
@@ -676,7 +696,7 @@ streamLoop:
 					return
 
 				case "error":
-					log.Printf("[ERROR] Stream error: %v", event.Error)
+					log.Printf("[ERROR] Stream error: %s", event.Error.Message)
 					if event.Error != nil && attempt < maxRetries {
 						msg := event.Error.Message
 						if strings.Contains(msg, "Rate limit") {
@@ -798,7 +818,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 				outputTokens = event.TotalUsage.OutputTokens
 			}
 		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+			log.Printf("[ERROR] Stream error: %s", event.Error.Message)
 		}
 	}
 

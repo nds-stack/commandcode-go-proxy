@@ -1,5 +1,10 @@
 package api
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // CommandCode API types (internal)
 
 type CCToolOutput struct {
@@ -57,6 +62,34 @@ type CCRequestBody struct {
 	PermissionMode string       `json:"permissionMode,omitempty"`
 }
 
+type CCError struct {
+	Message    string `json:"message"`
+	StatusCode *int   `json:"statusCode"`
+}
+
+func (e *CCError) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+
+	// Try string format first: "Model tried to call unavailable tool 'delete_files'"
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		e.Message = s
+		return nil
+	}
+
+	// Try object format: {"message":"...","statusCode":400}
+	type ccErrorAlias CCError
+	var obj ccErrorAlias
+	if err := json.Unmarshal(data, &obj); err != nil {
+		e.Message = fmt.Sprintf("%s", data)
+		return nil
+	}
+	*e = CCError(obj)
+	return nil
+}
+
 type CCStreamEvent struct {
 	Type         string         `json:"type"`
 	Text         string         `json:"text"`
@@ -66,10 +99,7 @@ type CCStreamEvent struct {
 	ToolCallID   string         `json:"toolCallId"`
 	ToolName     string         `json:"toolName"`
 	FinishReason string         `json:"finishReason"`
-	Error        *struct {
-		Message    string `json:"message"`
-		StatusCode *int   `json:"statusCode"`
-	} `json:"error"`
+	Error        *CCError       `json:"error"`
 	TotalUsage *struct {
 		InputTokens  int `json:"inputTokens"`
 		OutputTokens int `json:"outputTokens"`
