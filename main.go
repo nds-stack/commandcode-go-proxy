@@ -10,7 +10,7 @@ import (
 	"github.com/nds-stack/commandcode-go-proxy/internal/update"
 )
 
-const appVersion = "v0.2.1"
+const appVersion = "v0.3.0"
 const repositoryURL = "https://github.com/nds-stack/commandcode-go-proxy"
 const debugLogging = false
 

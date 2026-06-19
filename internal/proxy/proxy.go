@@ -172,11 +172,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	system, msgs := ExtractSystem(openAIReq.Messages)
 	ccMessages := ConvertMessages(msgs)
 
-	temperature := 0.3
 	maxTokens := 64000
-	if openAIReq.Temperature != nil {
-		temperature = *openAIReq.Temperature
-	}
 	if openAIReq.MaxTokens != nil {
 		maxTokens = *openAIReq.MaxTokens
 	}
@@ -201,14 +197,17 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			GitStatus:     "",
 			RecentCommits: []string{},
 		},
+		Memory:         "",
+		Taste:          nil,
+		Skills:         nil,
 		PermissionMode: "standard",
+		ThreadID:       uuid.New().String(),
 		Params: api.CCChatParams{
 			Model:            model,
 			Messages:         ccMessages,
 			Tools:            tools,
 			System:           system,
 			MaxTokens:        maxTokens,
-			Temperature:      temperature,
 			Stream:           true,
 			ReasoningEffort:  normalizeReasoningEffort(openAIReq.ReasoningEffort),
 		},
