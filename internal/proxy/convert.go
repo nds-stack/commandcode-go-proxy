@@ -75,8 +75,7 @@ func ConvertMessages(openAIMsgs []api.OpenAIMessage) []api.CCMessage {
 		if content == nil || len(content) == 0 {
 			continue
 		}
-		contentStr := contentToString(m.Content)
-		ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: contentStr})
+		ccMsgs = append(ccMsgs, api.CCMessage{Role: m.Role, Content: content})
 	}
 	return ccMsgs
 }
